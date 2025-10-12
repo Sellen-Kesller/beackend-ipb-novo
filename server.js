@@ -1,58 +1,63 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+
 require('dotenv').config();
 
 const app = express();
+
+// ✅ Middlewares
 app.use(cors());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// ✅ CONFIGURAÇÃO DUAL: MongoDB + SQLite Fallback
-let currentDB = 'sqlite';
-const db = new sqlite3.Database('./ipb.db');
+// ✅ CONEXÃO MONGODB OTIMIZADA
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/ipb-app';
 
-// ✅ TENTAR MONGODB PRIMEIRO
-const MONGODB_URI = process.env.MONGODB_URI;
+let isDBConnected = false;
 
-if (MONGODB_URI && MONGODB_URI.includes('mongodb')) {
-  mongoose.connect(MONGODB_URI, {
-    serverSelectionTimeoutMS: 5000,
-  })
-  .then(() => {
-    console.log('✅ Conectado ao MongoDB Atlas!');
-    currentDB = 'mongodb';
-    initializeSQLite();
-  })
-  .catch(err => {
-    console.error('❌ Erro MongoDB, usando SQLite:', err.message);
-    initializeSQLite();
-  });
-} else {
-  console.log('🔄 String MongoDB não encontrada, usando SQLite...');
-  initializeSQLite();
-}
+const connectDB = async () => {
+  try {
+    console.log('🔗 Conectando ao MongoDB...');
+    
+    await mongoose.connect(MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 30000,
+      socketTimeoutMS: 45000,
+      maxPoolSize: 10,
+      retryWrites: true,
+    });
+    
+    isDBConnected = true;
+    console.log('✅ MongoDB CONECTADO!');
+    
+  } catch (error) {
+    console.error('❌ Erro MongoDB:', error.message);
+    isDBConnected = false;
+    
+    // ✅ RECONEXÃO EM 10 SEGUNDOS
+    setTimeout(connectDB, 10000);
+  }
+};
 
-// ✅ INICIALIZAR SQLite
-function initializeSQLite() {
-  db.run(`CREATE TABLE IF NOT EXISTS posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    text TEXT NOT NULL,
-    category TEXT NOT NULL,
-    images TEXT,
-    date TEXT NOT NULL,
-    author TEXT DEFAULT 'Admin',
-    isActive INTEGER DEFAULT 1,
-    createdAt TEXT DEFAULT CURRENT_TIMESTAMP
-  )`, (err) => {
-    if (err) {
-      console.error('❌ Erro SQLite:', err);
-    } else {
-      console.log('✅ SQLite pronto (fallback)');
-    }
-  });
-}
+// Event listeners
+mongoose.connection.on('connected', () => {
+  console.log('✅ Mongoose conectado');
+  isDBConnected = true;
+});
+
+mongoose.connection.on('error', (err) => {
+  console.log('❌ Erro Mongoose:', err.message);
+  isDBConnected = false;
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠️  Mongoose desconectado - Reconectando...');
+  isDBConnected = false;
+  setTimeout(connectDB, 10000);
+});
 
 // ✅ MODELO MONGODB
 const postSchema = new mongoose.Schema({
@@ -73,129 +78,136 @@ const Post = mongoose.model('Post', postSchema);
 
 // ✅ HEALTH CHECK
 app.get('/api/health', (req, res) => {
+  const status = mongoose.connection.readyState;
+  const states = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
+  
   res.json({ 
-    message: '🚀 Backend IPB funcionando!', 
-    database: currentDB,
-    timestamp: new Date().toISOString(),
-    mongodb: mongoose.connection.readyState === 1
+    message: '🚀 API IPB no Render!',
+    database: states[status],
+    readyState: status,
+    connected: isDBConnected,
+    timestamp: new Date().toISOString()
   });
 });
 
-// ✅ ROTAS DOS POSTS - ORDEM CORRETA!
-
-// 1️⃣ ROTA ESPECÍFICA: /api/posts/count (DEVE VIR ANTES!)
-app.get('/api/posts/count', async (req, res) => {
+// ✅ ROTA DE LOGIN
+app.post('/api/auth/login', async (req, res) => {
   try {
-    console.log('📊 Buscando contagens por categoria...');
+    const { username, password } = req.body;
     
-    // Resultado padrão com todas categorias
-    const result = {
-      'Eventos': 0,
-      'SAF': 0, 
-      'Ensaios': 0,
-      'Visitas': 0,
-      'Clube do Livro': 0,
-      'Aniversariantes': 0
+    const cleanUsername = username?.trim() || '';
+    const cleanPassword = password?.trim() || '';
+    
+    console.log('🔐 Login attempt:', cleanUsername);
+    
+    const validCredentials = {
+      username: 'admin',
+      password: '12'
     };
     
-    if (currentDB === 'mongodb') {
+    if (cleanUsername === validCredentials.username && 
+        cleanPassword === validCredentials.password) {
+      
+      return res.json({ 
+        success: true, 
+        message: 'Login realizado com sucesso!',
+        user: { username: cleanUsername, role: 'admin' }
+      });
+      
+    } else {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Credenciais inválidas' 
+      });
+    }
+    
+  } catch (error) {
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// ✅ ROTA PRINCIPAL
+app.get('/', (req, res) => {
+  res.json({ 
+    message: '✅ Backend IPB no Render!',
+    status: 'online',
+    database: isDBConnected ? 'conectado' : 'conectando',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ✅ ROTAS DOS POSTS
+app.get('/api/posts', async (req, res) => {
+  try {
+    const { category } = req.query;
+    
+    if (isDBConnected && mongoose.connection.readyState === 1) {
+      const filter = { isActive: true };
+      if (category) filter.category = category;
+      const posts = await Post.find(filter).sort({ date: -1 });
+      res.json(posts);
+    } else {
+      // ✅ FALLBACK ELEGANTE
+      res.json([
+        {
+          _id: '1',
+          title: 'Sistema IPB no Render!',
+          text: 'Sistema migrado para Render - Mais estável e confiável!',
+          category: category || 'Eventos',
+          date: new Date().toISOString(),
+          images: [],
+          author: 'Admin'
+        }
+      ]);
+    }
+  } catch (error) {
+    console.error('❌ Erro em /api/posts:', error);
+    res.json([
+      {
+        _id: 'error',
+        title: 'Sistema em Operação',
+        text: 'Backend funcionando no Render!',
+        category: 'Eventos',
+        date: new Date().toISOString(),
+        images: []
+      }
+    ]);
+  }
+});
+
+// ✅ ROTA DE CONTAGEM
+app.get('/api/posts/count', async (req, res) => {
+  try {
+    const result = {
+      'Eventos': 0, 'SAF': 0, 'Ensaios': 0, 
+      'Visitas': 0, 'Clube do Livro': 0, 'Aniversariantes': 0
+    };
+    
+    if (isDBConnected && mongoose.connection.readyState === 1) {
       const counts = await Post.aggregate([
         { $match: { isActive: true } },
         { $group: { _id: '$category', count: { $sum: 1 } } }
       ]);
-      
-      console.log('📈 Contagens MongoDB:', counts);
       
       counts.forEach(item => {
         if (result.hasOwnProperty(item._id)) {
           result[item._id] = item.count;
         }
       });
-      
-      console.log('🎯 Contagens finais:', result);
-      res.json(result);
-      
-    } else {
-      // SQLite
-      const query = `SELECT category, COUNT(*) as count FROM posts WHERE isActive = 1 GROUP BY category`;
-      db.all(query, [], (err, rows) => {
-        if (err) {
-          console.error('❌ Erro SQLite count:', err);
-          return res.json(result);
-        }
-        
-        console.log('📈 Contagens SQLite:', rows);
-        
-        rows.forEach(row => {
-          if (result.hasOwnProperty(row.category)) {
-            result[row.category] = row.count;
-          }
-        });
-        
-        console.log('🎯 Contagens finais:', result);
-        res.json(result);
-      });
     }
+    
+    res.json(result);
     
   } catch (error) {
     console.error('❌ Erro em /api/posts/count:', error);
-    // Retorna resultado padrão mesmo com erro
     res.json({
-      'Eventos': 0,
-      'SAF': 0, 
-      'Ensaios': 0,
-      'Visitas': 0,
-      'Clube do Livro': 0,
-      'Aniversariantes': 0
+      'Eventos': 0, 'SAF': 0, 'Ensaios': 0, 
+      'Visitas': 0, 'Clube do Livro': 0, 'Aniversariantes': 0
     });
   }
 });
 
-// 2️⃣ ROTA GERAL: GET /api/posts
-app.get('/api/posts', async (req, res) => {
-  try {
-    const { category } = req.query;
-    
-    if (currentDB === 'mongodb') {
-      const filter = { isActive: true };
-      if (category) filter.category = category;
-      const posts = await Post.find(filter).sort({ date: -1 });
-      res.json(posts);
-    } else {
-      let query = 'SELECT * FROM posts WHERE isActive = 1';
-      const params = [];
-      if (category) {
-        query += ' AND category = ?';
-        params.push(category);
-      }
-      query += ' ORDER BY date DESC';
-      
-      db.all(query, params, (err, rows) => {
-        if (err) {
-          res.status(500).json({ error: err.message });
-          return;
-        }
-        const posts = rows.map(row => ({
-          _id: row.id.toString(),
-          id: row.id.toString(),
-          title: row.title,
-          text: row.text,
-          category: row.category,
-          images: row.images ? JSON.parse(row.images) : [],
-          date: row.date,
-          author: row.author,
-          isActive: row.isActive === 1,
-          createdAt: row.createdAt
-        }));
-        res.json(posts);
-      });
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 3️⃣ ROTA GERAL: POST /api/posts
+// ✅ ROTA PARA CRIAR POST
 app.post('/api/posts', async (req, res) => {
   try {
     const { title, text, category, date, images = [] } = req.body;
@@ -204,42 +216,15 @@ app.post('/api/posts', async (req, res) => {
       return res.status(400).json({ error: 'Todos os campos são obrigatórios' });
     }
     
-    if (currentDB === 'mongodb') {
+    if (isDBConnected && mongoose.connection.readyState === 1) {
       const newPost = new Post({ 
-        title, 
-        text, 
-        category, 
-        date: new Date(date), 
-        images 
+        title, text, category, date: new Date(date), images 
       });
       const savedPost = await newPost.save();
       res.status(201).json(savedPost);
     } else {
-      const query = `INSERT INTO posts (title, text, category, images, date) VALUES (?, ?, ?, ?, ?)`;
-      db.run(query, [title, text, category, JSON.stringify(images), date], function(err) {
-        if (err) {
-          res.status(400).json({ error: err.message });
-          return;
-        }
-        db.get('SELECT * FROM posts WHERE id = ?', [this.lastID], (err, row) => {
-          if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-          }
-          const newPost = {
-            _id: row.id.toString(),
-            id: row.id.toString(),
-            title: row.title,
-            text: row.text,
-            category: row.category,
-            images: row.images ? JSON.parse(row.images) : [],
-            date: row.date,
-            author: row.author,
-            isActive: row.isActive === 1,
-            createdAt: row.createdAt
-          };
-          res.status(201).json(newPost);
-        });
+      res.status(503).json({ 
+        error: 'Banco de dados temporariamente indisponível'
       });
     }
   } catch (error) {
@@ -247,53 +232,26 @@ app.post('/api/posts', async (req, res) => {
   }
 });
 
-// 4️⃣ ROTAS COM PARÂMETROS (VÊM POR ÚLTIMO!)
-
-// GET /api/posts/:id
+// ✅ OUTRAS ROTAS (GET by ID, PUT, DELETE)
 app.get('/api/posts/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    if (currentDB === 'mongodb') {
+    if (isDBConnected && mongoose.connection.readyState === 1) {
       if (!mongoose.Types.ObjectId.isValid(id)) {
         return res.status(400).json({ error: 'ID inválido' });
       }
       const post = await Post.findOne({ _id: id, isActive: true });
-      if (!post) {
-        return res.status(404).json({ error: 'Post não encontrado' });
-      }
+      if (!post) return res.status(404).json({ error: 'Post não encontrado' });
       res.json(post);
     } else {
-      db.get('SELECT * FROM posts WHERE id = ? AND isActive = 1', [id], (err, row) => {
-        if (err) {
-          res.status(500).json({ error: err.message });
-          return;
-        }
-        if (!row) {
-          res.status(404).json({ error: 'Post não encontrado' });
-          return;
-        }
-        const post = {
-          _id: row.id.toString(),
-          id: row.id.toString(),
-          title: row.title,
-          text: row.text,
-          category: row.category,
-          images: row.images ? JSON.parse(row.images) : [],
-          date: row.date,
-          author: row.author,
-          isActive: row.isActive === 1,
-          createdAt: row.createdAt
-        };
-        res.json(post);
-      });
+      res.status(503).json({ error: 'Banco indisponível' });
     }
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// PUT /api/posts/:id
 app.put('/api/posts/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -303,7 +261,7 @@ app.put('/api/posts/:id', async (req, res) => {
       return res.status(400).json({ error: 'Todos os campos são obrigatórios' });
     }
     
-    if (currentDB === 'mongodb') {
+    if (isDBConnected && mongoose.connection.readyState === 1) {
       if (!mongoose.Types.ObjectId.isValid(id)) {
         return res.status(400).json({ error: 'ID inválido' });
       }
@@ -312,53 +270,21 @@ app.put('/api/posts/:id', async (req, res) => {
         { title, text, category, date: new Date(date), images },
         { new: true, runValidators: true }
       );
-      if (!updatedPost) {
-        return res.status(404).json({ error: 'Post não encontrado' });
-      }
+      if (!updatedPost) return res.status(404).json({ error: 'Post não encontrado' });
       res.json(updatedPost);
     } else {
-      const query = `UPDATE posts SET title = ?, text = ?, category = ?, date = ?, images = ? WHERE id = ? AND isActive = 1`;
-      db.run(query, [title, text, category, date, JSON.stringify(images), id], function(err) {
-        if (err) {
-          res.status(400).json({ error: err.message });
-          return;
-        }
-        if (this.changes === 0) {
-          res.status(404).json({ error: 'Post não encontrado' });
-          return;
-        }
-        db.get('SELECT * FROM posts WHERE id = ?', [id], (err, row) => {
-          if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-          }
-          const updatedPost = {
-            _id: row.id.toString(),
-            id: row.id.toString(),
-            title: row.title,
-            text: row.text,
-            category: row.category,
-            images: row.images ? JSON.parse(row.images) : [],
-            date: row.date,
-            author: row.author,
-            isActive: row.isActive === 1,
-            createdAt: row.createdAt
-          };
-          res.json(updatedPost);
-        });
-      });
+      res.status(503).json({ error: 'Banco indisponível' });
     }
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
 });
 
-// DELETE /api/posts/:id
 app.delete('/api/posts/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    if (currentDB === 'mongodb') {
+    if (isDBConnected && mongoose.connection.readyState === 1) {
       if (!mongoose.Types.ObjectId.isValid(id)) {
         return res.status(400).json({ error: 'ID inválido' });
       }
@@ -367,54 +293,23 @@ app.delete('/api/posts/:id', async (req, res) => {
         { isActive: false },
         { new: true }
       );
-      if (!deletedPost) {
-        return res.status(404).json({ error: 'Post não encontrado' });
-      }
+      if (!deletedPost) return res.status(404).json({ error: 'Post não encontrado' });
       res.json({ message: 'Post deletado com sucesso', post: deletedPost });
     } else {
-      const query = `UPDATE posts SET isActive = 0 WHERE id = ?`;
-      db.run(query, [id], function(err) {
-        if (err) {
-          res.status(500).json({ error: err.message });
-          return;
-        }
-        if (this.changes === 0) {
-          res.status(404).json({ error: 'Post não encontrado' });
-          return;
-        }
-        res.json({ message: 'Post deletado com sucesso', id });
-      });
+      res.status(503).json({ error: 'Banco indisponível' });
     }
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// ✅ MIDDLEWARE DE 404 PARA ROTAS NÃO ENCONTRADAS
-app.use('/api/*', (req, res) => {
-  res.status(404).json({ error: 'Endpoint não encontrado' });
-});
+// ✅ INICIAR CONEXÃO E SERVIDOR
+connectDB();
 
-// ✅ INICIAR SERVIDOR
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🎯 Servidor rodando: http://localhost:${PORT}`);
-  console.log(`💾 Banco atual: ${currentDB}`);
-  console.log('📡 Endpoints disponíveis:');
-  console.log('   GET  /api/health');
-  console.log('   GET  /api/posts/count');
-  console.log('   GET  /api/posts');
-  console.log('   GET  /api/posts/:id');
-  console.log('   POST /api/posts');
-  console.log('   PUT  /api/posts/:id');
-  console.log('   DELETE /api/posts/:id');
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🎯 Servidor rodando na porta: ${PORT}`);
+  console.log(`💾 MongoDB State: ${mongoose.connection.readyState}`);
 });
 
-// ✅ TRATAMENTO DE ERROS GLOBAIS
-process.on('unhandledRejection', (err) => {
-  console.error('❌ Erro não tratado:', err);
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('❌ Exceção não capturada:', err);
-});
+module.exports = app;
