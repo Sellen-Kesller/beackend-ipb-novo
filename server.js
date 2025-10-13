@@ -2,7 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const User = require('./models/User'); // ✅ IMPORTE O MODELO DE USUÁRIO
+const User = require('./models/User'); 
 
 require('dotenv').config();
 
