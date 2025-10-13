@@ -2,7 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const User = require('./models/User'); 
+const bcrypt = require('bcryptjs'); // ✅ ADICIONAR BCRYPT
 
 require('dotenv').config();
 
@@ -15,13 +15,100 @@ app.use(express.json());
 // ✅ CONFIGURAÇÕES
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'ipb_jwt_secret_2024';
-const QUICK_TOKEN_SECRET = process.env.QUICK_TOKEN_SECRET || 'ipb_quick_token_2024';
 
 let isDBConnected = false;
+
+// ✅ MODELO DE USUÁRIO (INLINE PARA EVITAR ERROS DE IMPORTAÇÃO)
+const userSchema = new mongoose.Schema({
+  name: { 
+    type: String, 
+    required: true,
+    trim: true
+  },
+  username: { 
+    type: String, 
+    required: true, 
+    unique: true,
+    lowercase: true,
+    trim: true
+  },
+  password: { 
+    type: String, 
+    required: true 
+  },
+  role: { 
+    type: String, 
+    enum: ['admin', 'editor', 'viewer'], 
+    default: 'viewer' 
+  },
+  isActive: { 
+    type: Boolean, 
+    default: true 
+  },
+  lastLogin: { 
+    type: Date 
+  }
+}, { 
+  timestamps: true 
+});
+
+// ✅ MIDDLEWARE PARA HASH DA SENHA
+userSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  
+  try {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ✅ MÉTODO PARA COMPARAR SENHA
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  return await bcrypt.compare(candidatePassword, this.password);
+};
+
+// ✅ MÉTODO PARA DADOS PÚBLICOS
+userSchema.methods.toPublicJSON = function() {
+  return {
+    _id: this._id,
+    name: this.name,
+    username: this.username,
+    role: this.role,
+    isActive: this.isActive,
+    lastLogin: this.lastLogin,
+    createdAt: this.createdAt
+  };
+};
+
+const User = mongoose.model('User', userSchema);
+
+// ✅ MODELO DE POST
+const postSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  text: { type: String, required: true },
+  category: { 
+    type: String, 
+    required: true,
+    enum: ['Eventos', 'SAF', 'Ensaios', 'Visitas', 'Clube do Livro', 'Aniversariantes']
+  },
+  images: [{ type: String }],
+  date: { type: Date, required: true },
+  author: { type: String, default: 'Admin' },
+  isActive: { type: Boolean, default: true }
+}, { timestamps: true });
+
+const Post = mongoose.model('Post', postSchema);
 
 const connectDB = async () => {
   try {
     console.log('🔗 Conectando ao MongoDB...');
+    
+    if (!MONGODB_URI) {
+      throw new Error('MONGODB_URI não definida');
+    }
     
     await mongoose.connect(MONGODB_URI, {
       useNewUrlParser: true,
@@ -61,13 +148,6 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ✅ MIDDLEWARE PARA VERIFICAR PERMISSÕES
-const requireAuth = (req, res, next) => {
-  if (!req.user) {
-    return res.status(401).json({ error: 'Autenticação requerida' });
-  }
-  next();
-};
-
 const requireAdminOrEditor = (req, res, next) => {
   if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'editor')) {
     return res.status(403).json({ error: 'Acesso negado. Apenas administradores e editores.' });
@@ -91,7 +171,6 @@ const createInitialUsers = async () => {
       { name: 'Marcio', username: 'marcio', password: '1010', role: 'admin' },
       { name: 'Milena', username: 'milena', password: '1111', role: 'admin' },
       { name: 'Sabrina', username: 'sabrina', password: '2020', role: 'admin' },
-      // ✅ USUÁRIO VIEWER PARA TESTE
       { name: 'Visitante', username: 'visitante', password: '0000', role: 'viewer' }
     ];
 
@@ -158,13 +237,13 @@ app.post('/api/auth/login', async (req, res) => {
     // Gerar JWT Token
     const token = jwt.sign(
       { 
-        userId: user._id, 
+        userId: user._id.toString(), // ✅ CONVERTER PARA STRING
         username: user.username, 
         name: user.name, 
         role: user.role 
       },
       JWT_SECRET,
-      { expiresIn: '30d' } // Token expira em 30 dias
+      { expiresIn: '30d' }
     );
     
     console.log(`✅ Login bem-sucedido: ${user.name} (${user.role})`);
@@ -204,6 +283,7 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
     });
     
   } catch (error) {
+    console.error('❌ Erro ao verificar token:', error);
     res.status(500).json({ 
       success: false, 
       error: 'Erro ao verificar token' 
@@ -212,8 +292,6 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
 });
 
 // ✅ ROTAS DE USUÁRIOS (APENAS ADMINS)
-
-// LISTAR TODOS OS USUÁRIOS
 app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const users = await User.find({}, '-password');
@@ -223,7 +301,6 @@ app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
-// CRIAR NOVO USUÁRIO
 app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { name, username, password, role = 'viewer' } = req.body;
@@ -240,7 +317,7 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
     const newUser = new User({
       name,
       username: username.toLowerCase(),
-      password, // A senha será hasheada automaticamente pelo middleware
+      password,
       role
     });
     
@@ -258,40 +335,7 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
-// ATUALIZAR USUÁRIO
-app.put('/api/users/:id', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, role, isActive, preferences } = req.body;
-    
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ error: 'ID inválido' });
-    }
-    
-    const updatedUser = await User.findByIdAndUpdate(
-      id,
-      { name, role, isActive, preferences },
-      { new: true, select: '-password' }
-    );
-    
-    if (!updatedUser) {
-      return res.status(404).json({ error: 'Usuário não encontrado' });
-    }
-    
-    res.json({
-      success: true,
-      message: 'Usuário atualizado com sucesso',
-      user: updatedUser
-    });
-    
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
 // ✅ ROTAS DE POSTS COM CONTROLE DE ACESSO
-
-// GET POSTS (PÚBLICO - TODOS PODEM VER)
 app.get('/api/posts', async (req, res) => {
   try {
     const { category } = req.query;
@@ -310,7 +354,8 @@ app.get('/api/posts', async (req, res) => {
         category: category || 'Eventos',
         date: new Date().toISOString(),
         images: [],
-        author: 'Sistema'
+        author: 'Sistema',
+        isActive: true
       }]);
     }
   } catch (error) {
@@ -334,13 +379,14 @@ app.post('/api/posts', authenticateToken, requireAdminOrEditor, async (req, res)
       category, 
       date: new Date(date), 
       images,
-      author: req.user.name // ✅ USA O NOME DO USUÁRIO LOGADO
+      author: req.user.name
     });
     
     const savedPost = await newPost.save();
     res.status(201).json(savedPost);
     
   } catch (error) {
+    console.error('❌ Erro ao criar post:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -371,6 +417,7 @@ app.put('/api/posts/:id', authenticateToken, requireAdminOrEditor, async (req, r
     res.json(updatedPost);
     
   } catch (error) {
+    console.error('❌ Erro ao atualizar post:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -396,14 +443,20 @@ app.delete('/api/posts/:id', authenticateToken, requireAdminOrEditor, async (req
     res.json({ message: 'Post deletado com sucesso', post: deletedPost });
     
   } catch (error) {
+    console.error('❌ Erro ao deletar post:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ✅ ROTAS PÚBLICAS
+// ✅ ROTA DE HEALTH CHECK
 app.get('/api/health', (req, res) => {
   const status = mongoose.connection.readyState;
-  const states = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
+  const states = { 
+    0: 'disconnected', 
+    1: 'connected', 
+    2: 'connecting', 
+    3: 'disconnecting' 
+  };
   
   res.json({ 
     message: '🚀 API IPB com Sistema de Usuários!',
@@ -414,27 +467,61 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// ✅ ROTA PRINCIPAL
 app.get('/', (req, res) => {
   res.json({ 
     message: '✅ Backend IPB - Sistema Completo!',
-    features: [
-      'Sistema de usuários com roles (admin, editor, viewer)',
-      'Autenticação JWT',
-      'Login automático com token',
-      'Controle de acesso granular'
-    ],
+    status: 'online',
+    database: isDBConnected ? 'conectado' : 'conectando',
     timestamp: new Date().toISOString()
+  });
+});
+
+// ✅ ROTA PARA API INFO
+app.get('/api', (req, res) => {
+  res.json({ 
+    message: '📡 API IPB - Endpoints disponíveis',
+    endpoints: {
+      auth: {
+        login: 'POST /api/auth/login',
+        verify: 'GET /api/auth/verify'
+      },
+      users: {
+        list: 'GET /api/users',
+        create: 'POST /api/users'
+      },
+      posts: {
+        list: 'GET /api/posts',
+        create: 'POST /api/posts',
+        update: 'PUT /api/posts/:id',
+        delete: 'DELETE /api/posts/:id'
+      }
+    }
+  });
+});
+
+// ✅ MIDDLEWARE PARA ROTAS NÃO ENCONTRADAS
+app.use('*', (req, res) => {
+  res.status(404).json({ 
+    error: 'Endpoint não encontrado',
+    available: ['/', '/api', '/api/health', '/api/auth/login', '/api/posts']
   });
 });
 
 // ✅ INICIAR CONEXÃO
 connectDB();
 
+// ✅ INICIAR SERVIDOR
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🎯 Servidor rodando na porta: ${PORT}`);
-  console.log(`🔐 Sistema de autenticação JWT ativo`);
-  console.log(`👥 Usuários: Almir(1515), Franklin(1212), Marcio(1010), Milena(1111), Sabrina(2020)`);
+  console.log(`🔐 JWT Secret: ${JWT_SECRET ? 'Configurado' : 'Usando padrão'}`);
+  console.log(`🌐 URL: http://localhost:${PORT}`);
+  console.log(`📡 Endpoints:`);
+  console.log(`   GET  /`);
+  console.log(`   GET  /api/health`);
+  console.log(`   POST /api/auth/login`);
+  console.log(`   GET  /api/posts`);
 });
 
 module.exports = app;
