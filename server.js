@@ -2,7 +2,10 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs'); // ✅ ADICIONAR BCRYPT
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 require('dotenv').config();
 
@@ -15,10 +18,49 @@ app.use(express.json());
 // ✅ CONFIGURAÇÕES
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'ipb_jwt_secret_2024';
+const PORT = process.env.PORT || 10000;
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 let isDBConnected = false;
 
-// ✅ MODELO DE USUÁRIO (INLINE PARA EVITAR ERROS DE IMPORTAÇÃO)
+// ✅ CONFIGURAÇÃO DO MULTER PARA UPLOAD
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = 'uploads/posts/';
+    
+    // ✅ Criar diretório se não existir
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    // ✅ Nome único para o arquivo
+    const uniqueName = `post_${Date.now()}_${Math.round(Math.random() * 1E9)}${path.extname(file.originalname)}`;
+    cb(null, uniqueName);
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limite
+  },
+  fileFilter: (req, file, cb) => {
+    // ✅ Validar apenas imagens
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Apenas imagens são permitidas!'), false);
+    }
+  }
+});
+
+// ✅ SERVIR ARQUIVOS ESTÁTICOS (IMPORTANTE!)
+app.use('/uploads', express.static('uploads'));
+
+// ✅ MODELO DE USUÁRIO
 const userSchema = new mongoose.Schema({
   name: { 
     type: String, 
@@ -99,6 +141,37 @@ const postSchema = new mongoose.Schema({
   author: { type: String, default: 'Admin' },
   isActive: { type: Boolean, default: true }
 }, { timestamps: true });
+
+// ✅ MIDDLEWARE PARA GARANTIR QUE IMAGES SEJA ARRAY
+postSchema.pre('save', function(next) {
+  if (this.images && !Array.isArray(this.images)) {
+    this.images = [this.images];
+  }
+  next();
+});
+
+// ✅ MÉTODO PARA LIMPEZA DE IMAGENS ORFÃS
+postSchema.statics.cleanupOrphanedImages = async function() {
+  try {
+    const usedImages = await this.distinct('images');
+    const uploadDir = 'uploads/posts/';
+    
+    if (fs.existsSync(uploadDir)) {
+      const files = fs.readdirSync(uploadDir);
+      
+      for (const file of files) {
+        const fileUrl = `${BASE_URL}/uploads/posts/${file}`;
+        
+        if (!usedImages.includes(fileUrl)) {
+          fs.unlinkSync(path.join(uploadDir, file));
+          console.log('🧹 Imagem órfã removida:', file);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('❌ Erro na limpeza de imagens:', error);
+  }
+};
 
 const Post = mongoose.model('Post', postSchema);
 
@@ -237,7 +310,7 @@ app.post('/api/auth/login', async (req, res) => {
     // Gerar JWT Token
     const token = jwt.sign(
       { 
-        userId: user._id.toString(), // ✅ CONVERTER PARA STRING
+        userId: user._id.toString(),
         username: user.username, 
         name: user.name, 
         role: user.role 
@@ -291,6 +364,101 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
   }
 });
 
+// ✅ ROTAS DE UPLOAD DE IMAGENS
+
+// UPLOAD DE IMAGEM ÚNICA
+app.post('/api/upload', authenticateToken, requireAdminOrEditor, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Nenhuma imagem enviada' 
+      });
+    }
+
+    // ✅ URL permanente da imagem
+    const imageUrl = `${BASE_URL}/uploads/posts/${req.file.filename}`;
+
+    console.log('✅ Upload realizado:', imageUrl);
+
+    res.json({ 
+      success: true, 
+      imageUrl,
+      filename: req.file.filename,
+      message: 'Upload realizado com sucesso' 
+    });
+
+  } catch (error) {
+    console.error('❌ Erro no upload:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Erro no upload da imagem' 
+    });
+  }
+});
+
+// UPLOAD MÚLTIPLO DE IMAGENS
+app.post('/api/upload-multiple', authenticateToken, requireAdminOrEditor, upload.array('images', 10), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Nenhuma imagem enviada' 
+      });
+    }
+    
+    // ✅ URLs de todas as imagens
+    const imageUrls = req.files.map(file => 
+      `${BASE_URL}/uploads/posts/${file.filename}`
+    );
+
+    console.log('✅ Upload múltiplo realizado:', imageUrls.length, 'imagens');
+
+    res.json({ 
+      success: true, 
+      imageUrls,
+      message: `${imageUrls.length} imagens uploadadas com sucesso` 
+    });
+
+  } catch (error) {
+    console.error('❌ Erro no upload múltiplo:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Erro no upload das imagens' 
+    });
+  }
+});
+
+// DELETAR IMAGEM
+app.delete('/api/upload/:filename', authenticateToken, requireAdminOrEditor, async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const filePath = path.join('uploads/posts/', filename);
+
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      console.log('🗑️ Imagem deletada:', filename);
+      
+      res.json({ 
+        success: true, 
+        message: 'Imagem deletada com sucesso' 
+      });
+    } else {
+      res.status(404).json({ 
+        success: false, 
+        error: 'Arquivo não encontrado' 
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Erro ao deletar imagem:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Erro ao deletar imagem' 
+    });
+  }
+});
+
 // ✅ ROTAS DE USUÁRIOS (APENAS ADMINS)
 app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
@@ -335,7 +503,9 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
-// ✅ ROTAS DE POSTS COM CONTROLE DE ACESSO
+// ✅ ROTAS DE POSTS
+
+// LISTAR POSTS (PÚBLICO)
 app.get('/api/posts', async (req, res) => {
   try {
     const { category } = req.query;
@@ -364,7 +534,7 @@ app.get('/api/posts', async (req, res) => {
   }
 });
 
-// ✅ CRIAÇÃO/EDIÇÃO/EXCLUSÃO APENAS PARA ADMINS E EDITORS
+// CRIAR POST (APENAS ADMINS/EDITORS)
 app.post('/api/posts', authenticateToken, requireAdminOrEditor, async (req, res) => {
   try {
     const { title, text, category, date, images = [] } = req.body;
@@ -383,6 +553,12 @@ app.post('/api/posts', authenticateToken, requireAdminOrEditor, async (req, res)
     });
     
     const savedPost = await newPost.save();
+    
+    // ✅ Limpeza periódica de imagens órfãs
+    setTimeout(() => {
+      Post.cleanupOrphanedImages();
+    }, 10000);
+    
     res.status(201).json(savedPost);
     
   } catch (error) {
@@ -391,6 +567,7 @@ app.post('/api/posts', authenticateToken, requireAdminOrEditor, async (req, res)
   }
 });
 
+// ATUALIZAR POST (APENAS ADMINS/EDITORS)
 app.put('/api/posts/:id', authenticateToken, requireAdminOrEditor, async (req, res) => {
   try {
     const { id } = req.params;
@@ -414,6 +591,11 @@ app.put('/api/posts/:id', authenticateToken, requireAdminOrEditor, async (req, r
       return res.status(404).json({ error: 'Post não encontrado' });
     }
     
+    // ✅ Limpeza periódica de imagens órfãs
+    setTimeout(() => {
+      Post.cleanupOrphanedImages();
+    }, 10000);
+    
     res.json(updatedPost);
     
   } catch (error) {
@@ -422,6 +604,7 @@ app.put('/api/posts/:id', authenticateToken, requireAdminOrEditor, async (req, r
   }
 });
 
+// DELETAR POST (APENAS ADMINS/EDITORS)
 app.delete('/api/posts/:id', authenticateToken, requireAdminOrEditor, async (req, res) => {
   try {
     const { id } = req.params;
@@ -430,15 +613,23 @@ app.delete('/api/posts/:id', authenticateToken, requireAdminOrEditor, async (req
       return res.status(400).json({ error: 'ID inválido' });
     }
     
+    // ✅ Buscar o post primeiro para possível limpeza de imagens
+    const post = await Post.findById(id);
+    
+    if (!post) {
+      return res.status(404).json({ error: 'Post não encontrado' });
+    }
+    
     const deletedPost = await Post.findByIdAndUpdate(
       id, 
       { isActive: false },
       { new: true }
     );
     
-    if (!deletedPost) {
-      return res.status(404).json({ error: 'Post não encontrado' });
-    }
+    // ✅ Limpeza periódica de imagens órfãs
+    setTimeout(() => {
+      Post.cleanupOrphanedImages();
+    }, 10000);
     
     res.json({ message: 'Post deletado com sucesso', post: deletedPost });
     
@@ -459,10 +650,11 @@ app.get('/api/health', (req, res) => {
   };
   
   res.json({ 
-    message: '🚀 API IPB com Sistema de Usuários!',
+    message: '🚀 API IPB com Sistema de Upload!',
     database: states[status],
     readyState: status,
     connected: isDBConnected,
+    uploads: fs.existsSync('uploads/posts/') ? 'ativo' : 'inativo',
     timestamp: new Date().toISOString()
   });
 });
@@ -470,9 +662,10 @@ app.get('/api/health', (req, res) => {
 // ✅ ROTA PRINCIPAL
 app.get('/', (req, res) => {
   res.json({ 
-    message: '✅ Backend IPB - Sistema Completo!',
+    message: '✅ Backend IPB - Sistema Completo com Upload!',
     status: 'online',
     database: isDBConnected ? 'conectado' : 'conectando',
+    uploads: 'ativo',
     timestamp: new Date().toISOString()
   });
 });
@@ -485,6 +678,11 @@ app.get('/api', (req, res) => {
       auth: {
         login: 'POST /api/auth/login',
         verify: 'GET /api/auth/verify'
+      },
+      upload: {
+        single: 'POST /api/upload',
+        multiple: 'POST /api/upload-multiple',
+        delete: 'DELETE /api/upload/:filename'
       },
       users: {
         list: 'GET /api/users',
@@ -504,24 +702,41 @@ app.get('/api', (req, res) => {
 app.use('*', (req, res) => {
   res.status(404).json({ 
     error: 'Endpoint não encontrado',
-    available: ['/', '/api', '/api/health', '/api/auth/login', '/api/posts']
+    available: ['/', '/api', '/api/health', '/api/auth/login', '/api/posts', '/api/upload']
   });
+});
+
+// ✅ MIDDLEWARE DE ERRO PARA MULTER
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'Arquivo muito grande. Máximo 5MB.' });
+    }
+  }
+  res.status(500).json({ error: error.message });
 });
 
 // ✅ INICIAR CONEXÃO
 connectDB();
 
 // ✅ INICIAR SERVIDOR
-const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🎯 Servidor rodando na porta: ${PORT}`);
   console.log(`🔐 JWT Secret: ${JWT_SECRET ? 'Configurado' : 'Usando padrão'}`);
-  console.log(`🌐 URL: http://localhost:${PORT}`);
-  console.log(`📡 Endpoints:`);
-  console.log(`   GET  /`);
+  console.log(`🌐 URL: ${BASE_URL}`);
+  console.log(`📁 Uploads: ${BASE_URL}/uploads/posts/`);
+  console.log(`📡 Endpoints principais:`);
   console.log(`   GET  /api/health`);
   console.log(`   POST /api/auth/login`);
+  console.log(`   POST /api/upload`);
   console.log(`   GET  /api/posts`);
 });
+
+// ✅ LIMPEZA PERIÓDICA DE IMAGENS ORFÃS (a cada 1 hora)
+setInterval(() => {
+  if (isDBConnected) {
+    Post.cleanupOrphanedImages();
+  }
+}, 60 * 60 * 1000);
 
 module.exports = app;
