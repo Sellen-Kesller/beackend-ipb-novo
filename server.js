@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const { GridFSBucket } = require('mongodb');
 
 require('dotenv').config();
 
@@ -22,28 +23,11 @@ const PORT = process.env.PORT || 10000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 let isDBConnected = false;
+let gridFSBucket;
 
-// ✅ CONFIGURAÇÃO DO MULTER PARA UPLOAD
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/posts/';
-    
-    // ✅ Criar diretório se não existir
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    // ✅ Nome único para o arquivo
-    const uniqueName = `post_${Date.now()}_${Math.round(Math.random() * 1E9)}${path.extname(file.originalname)}`;
-    cb(null, uniqueName);
-  }
-});
-
+// ✅ CONFIGURAÇÃO DO MULTER PARA UPLOAD TEMPORÁRIO
 const upload = multer({
-  storage: storage,
+  dest: 'temp_uploads/', // Pasta temporária
   limits: {
     fileSize: 5 * 1024 * 1024, // 5MB limite
   },
@@ -57,8 +41,11 @@ const upload = multer({
   }
 });
 
-// ✅ SERVIR ARQUIVOS ESTÁTICOS (IMPORTANTE!)
-app.use('/uploads', express.static('uploads'));
+// ✅ Criar pasta temporária se não existir
+const tempDir = 'temp_uploads/';
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
+}
 
 // ✅ MODELO DE USUÁRIO
 const userSchema = new mongoose.Schema({
@@ -136,7 +123,7 @@ const postSchema = new mongoose.Schema({
     required: true,
     enum: ['Eventos', 'SAF', 'Ensaios', 'Visitas', 'Clube do Livro', 'Aniversariantes']
   },
-  images: [{ type: String }],
+  images: [{ type: String }], // Agora serão URLs como: /api/images/IMAGE_ID
   date: { type: Date, required: true },
   author: { type: String, default: 'Admin' },
   isActive: { type: Boolean, default: true }
@@ -150,26 +137,32 @@ postSchema.pre('save', function(next) {
   next();
 });
 
-// ✅ MÉTODO PARA LIMPEZA DE IMAGENS ORFÃS
+// ✅ MÉTODO PARA LIMPEZA DE IMAGENS ORFÃS NO GRIDFS
 postSchema.statics.cleanupOrphanedImages = async function() {
   try {
-    const usedImages = await this.distinct('images');
-    const uploadDir = 'uploads/posts/';
+    if (!gridFSBucket) return;
     
-    if (fs.existsSync(uploadDir)) {
-      const files = fs.readdirSync(uploadDir);
-      
-      for (const file of files) {
-        const fileUrl = `${BASE_URL}/uploads/posts/${file}`;
-        
-        if (!usedImages.includes(fileUrl)) {
-          fs.unlinkSync(path.join(uploadDir, file));
-          console.log('🧹 Imagem órfã removida:', file);
-        }
+    // Buscar todas as imagens usadas nos posts
+    const usedImages = await this.distinct('images');
+    
+    // Extrair IDs das imagens das URLs
+    const usedImageIds = usedImages.map(url => {
+      const match = url.match(/\/api\/images\/([a-f0-9]{24})/);
+      return match ? match[1] : null;
+    }).filter(id => id).map(id => new mongoose.Types.ObjectId(id));
+    
+    // Buscar todas as imagens no GridFS
+    const allImages = await gridFSBucket.find().toArray();
+    
+    // Deletar imagens não usadas
+    for (const image of allImages) {
+      if (!usedImageIds.some(usedId => usedId.equals(image._id))) {
+        await gridFSBucket.delete(image._id);
+        console.log('🧹 Imagem órfã removida do GridFS:', image.filename);
       }
     }
   } catch (error) {
-    console.error('❌ Erro na limpeza de imagens:', error);
+    console.error('❌ Erro na limpeza do GridFS:', error);
   }
 };
 
@@ -191,6 +184,12 @@ const connectDB = async () => {
     
     isDBConnected = true;
     console.log('✅ MongoDB CONECTADO!');
+    
+    // ✅ CONFIGURAR GRIDFS BUCKET
+    gridFSBucket = new GridFSBucket(mongoose.connection.db, {
+      bucketName: 'posts_images'
+    });
+    console.log('✅ GridFS Bucket configurado!');
     
     // ✅ CRIA USUÁRIOS INICIAIS
     await createInitialUsers();
@@ -364,7 +363,7 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
   }
 });
 
-// ✅ ROTAS DE UPLOAD DE IMAGENS
+// ✅ ROTAS DE UPLOAD DE IMAGENS COM GRIDFS
 
 // UPLOAD DE IMAGEM ÚNICA
 app.post('/api/upload', authenticateToken, requireAdminOrEditor, upload.single('image'), async (req, res) => {
@@ -376,20 +375,60 @@ app.post('/api/upload', authenticateToken, requireAdminOrEditor, upload.single('
       });
     }
 
-    // ✅ URL permanente da imagem
-    const imageUrl = `${BASE_URL}/uploads/posts/${req.file.filename}`;
+    // ✅ Criar stream de leitura do arquivo
+    const readStream = fs.createReadStream(req.file.path);
+    
+    // ✅ Nome único para o arquivo
+    const filename = `post_${Date.now()}_${req.file.originalname}`;
+    
+    // ✅ Upload para GridFS
+    const uploadStream = gridFSBucket.openUploadStream(filename, {
+      metadata: {
+        originalName: req.file.originalname,
+        mimetype: req.file.mimetype,
+        uploadedBy: req.user.userId,
+        uploadedAt: new Date()
+      }
+    });
 
-    console.log('✅ Upload realizado:', imageUrl);
+    // ✅ Pipe do arquivo para o GridFS
+    readStream.pipe(uploadStream);
 
-    res.json({ 
-      success: true, 
-      imageUrl,
-      filename: req.file.filename,
-      message: 'Upload realizado com sucesso' 
+    uploadStream.on('error', (error) => {
+      console.error('❌ Erro no upload GridFS:', error);
+      fs.unlinkSync(req.file.path); // Limpar arquivo temporário
+      res.status(500).json({ 
+        success: false, 
+        error: 'Erro no upload da imagem' 
+      });
+    });
+
+    uploadStream.on('finish', () => {
+      // ✅ Deletar arquivo temporário
+      fs.unlinkSync(req.file.path);
+      
+      // ✅ URL para acessar a imagem
+      const imageUrl = `/api/images/${uploadStream.id}`;
+      
+      console.log('✅ Upload GridFS realizado:', filename);
+      
+      res.json({ 
+        success: true, 
+        imageUrl: `${BASE_URL}${imageUrl}`,
+        imageId: uploadStream.id.toString(),
+        filename: filename,
+        message: 'Upload realizado com sucesso' 
+      });
     });
 
   } catch (error) {
     console.error('❌ Erro no upload:', error);
+    
+    // ✅ Limpar arquivo temporário em caso de erro
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+    
     res.status(500).json({ 
       success: false, 
       error: 'Erro no upload da imagem' 
@@ -407,12 +446,43 @@ app.post('/api/upload-multiple', authenticateToken, requireAdminOrEditor, upload
       });
     }
     
-    // ✅ URLs de todas as imagens
-    const imageUrls = req.files.map(file => 
-      `${BASE_URL}/uploads/posts/${file.filename}`
-    );
+    const imageUrls = [];
+    
+    // ✅ Upload de cada imagem para GridFS
+    for (const file of req.files) {
+      try {
+        const readStream = fs.createReadStream(file.path);
+        const filename = `post_${Date.now()}_${file.originalname}`;
+        
+        const uploadStream = gridFSBucket.openUploadStream(filename, {
+          metadata: {
+            originalName: file.originalname,
+            mimetype: file.mimetype,
+            uploadedBy: req.user.userId,
+            uploadedAt: new Date()
+          }
+        });
 
-    console.log('✅ Upload múltiplo realizado:', imageUrls.length, 'imagens');
+        await new Promise((resolve, reject) => {
+          readStream.pipe(uploadStream);
+          
+          uploadStream.on('finish', () => {
+            const imageUrl = `/api/images/${uploadStream.id}`;
+            imageUrls.push(`${BASE_URL}${imageUrl}`);
+            fs.unlinkSync(file.path); // Limpar arquivo temporário
+            resolve();
+          });
+          
+          uploadStream.on('error', reject);
+        });
+        
+      } catch (fileError) {
+        console.error('❌ Erro no upload de um arquivo:', fileError);
+        // Continuar com outros arquivos
+      }
+    }
+
+    console.log('✅ Upload múltiplo GridFS realizado:', imageUrls.length, 'imagens');
 
     res.json({ 
       success: true, 
@@ -422,6 +492,16 @@ app.post('/api/upload-multiple', authenticateToken, requireAdminOrEditor, upload
 
   } catch (error) {
     console.error('❌ Erro no upload múltiplo:', error);
+    
+    // ✅ Limpar arquivos temporários em caso de erro
+    if (req.files) {
+      req.files.forEach(file => {
+        if (fs.existsSync(file.path)) {
+          fs.unlinkSync(file.path);
+        }
+      });
+    }
+    
     res.status(500).json({ 
       success: false, 
       error: 'Erro no upload das imagens' 
@@ -429,26 +509,77 @@ app.post('/api/upload-multiple', authenticateToken, requireAdminOrEditor, upload
   }
 });
 
-// DELETAR IMAGEM
-app.delete('/api/upload/:filename', authenticateToken, requireAdminOrEditor, async (req, res) => {
+// ✅ ROTA PARA SERVIR IMAGENS DO GRIDFS
+app.get('/api/images/:imageId', async (req, res) => {
   try {
-    const { filename } = req.params;
-    const filePath = path.join('uploads/posts/', filename);
+    const { imageId } = req.params;
+    
+    if (!mongoose.Types.ObjectId.isValid(imageId)) {
+      return res.status(400).json({ error: 'ID de imagem inválido' });
+    }
+    
+    const fileId = new mongoose.Types.ObjectId(imageId);
+    
+    // ✅ Buscar metadados do arquivo
+    const files = await gridFSBucket.find({ _id: fileId }).toArray();
+    
+    if (!files || files.length === 0) {
+      return res.status(404).json({ error: 'Imagem não encontrada' });
+    }
+    
+    const file = files[0];
+    
+    // ✅ Configurar headers
+    res.set('Content-Type', file.metadata?.mimetype || 'image/jpeg');
+    res.set('Content-Disposition', `inline; filename="${file.filename}"`);
+    res.set('Cache-Control', 'public, max-age=31536000'); // Cache de 1 ano
+    
+    // ✅ Stream da imagem para a resposta
+    const downloadStream = gridFSBucket.openDownloadStream(fileId);
+    
+    downloadStream.on('error', (error) => {
+      console.error('❌ Erro ao servir imagem:', error);
+      res.status(404).json({ error: 'Imagem não encontrada' });
+    });
+    
+    downloadStream.pipe(res);
+    
+  } catch (error) {
+    console.error('❌ Erro ao servir imagem:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
 
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      console.log('🗑️ Imagem deletada:', filename);
-      
-      res.json({ 
-        success: true, 
-        message: 'Imagem deletada com sucesso' 
-      });
-    } else {
-      res.status(404).json({ 
+// DELETAR IMAGEM DO GRIDFS
+app.delete('/api/upload/:imageId', authenticateToken, requireAdminOrEditor, async (req, res) => {
+  try {
+    const { imageId } = req.params;
+    
+    if (!mongoose.Types.ObjectId.isValid(imageId)) {
+      return res.status(400).json({ error: 'ID de imagem inválido' });
+    }
+    
+    const fileId = new mongoose.Types.ObjectId(imageId);
+    
+    // ✅ Verificar se a imagem existe
+    const files = await gridFSBucket.find({ _id: fileId }).toArray();
+    
+    if (!files || files.length === 0) {
+      return res.status(404).json({ 
         success: false, 
-        error: 'Arquivo não encontrado' 
+        error: 'Imagem não encontrada' 
       });
     }
+    
+    // ✅ Deletar do GridFS
+    await gridFSBucket.delete(fileId);
+    
+    console.log('🗑️ Imagem deletada do GridFS:', imageId);
+    
+    res.json({ 
+      success: true, 
+      message: 'Imagem deletada com sucesso' 
+    });
 
   } catch (error) {
     console.error('❌ Erro ao deletar imagem:', error);
@@ -650,11 +781,11 @@ app.get('/api/health', (req, res) => {
   };
   
   res.json({ 
-    message: '🚀 API IPB com Sistema de Upload!',
+    message: '🚀 API IPB com Sistema de Upload GridFS!',
     database: states[status],
     readyState: status,
     connected: isDBConnected,
-    uploads: fs.existsSync('uploads/posts/') ? 'ativo' : 'inativo',
+    gridfs: gridFSBucket ? 'ativo' : 'inativo',
     timestamp: new Date().toISOString()
   });
 });
@@ -662,10 +793,10 @@ app.get('/api/health', (req, res) => {
 // ✅ ROTA PRINCIPAL
 app.get('/', (req, res) => {
   res.json({ 
-    message: '✅ Backend IPB - Sistema Completo com Upload!',
+    message: '✅ Backend IPB - Sistema Completo com GridFS Upload!',
     status: 'online',
     database: isDBConnected ? 'conectado' : 'conectando',
-    uploads: 'ativo',
+    gridfs: gridFSBucket ? 'ativo' : 'inativo',
     timestamp: new Date().toISOString()
   });
 });
@@ -682,7 +813,8 @@ app.get('/api', (req, res) => {
       upload: {
         single: 'POST /api/upload',
         multiple: 'POST /api/upload-multiple',
-        delete: 'DELETE /api/upload/:filename'
+        delete: 'DELETE /api/upload/:imageId',
+        serve: 'GET /api/images/:imageId'
       },
       users: {
         list: 'GET /api/users',
@@ -702,7 +834,7 @@ app.get('/api', (req, res) => {
 app.use('*', (req, res) => {
   res.status(404).json({ 
     error: 'Endpoint não encontrado',
-    available: ['/', '/api', '/api/health', '/api/auth/login', '/api/posts', '/api/upload']
+    available: ['/', '/api', '/api/health', '/api/auth/login', '/api/posts', '/api/upload', '/api/images/:id']
   });
 });
 
@@ -724,17 +856,18 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🎯 Servidor rodando na porta: ${PORT}`);
   console.log(`🔐 JWT Secret: ${JWT_SECRET ? 'Configurado' : 'Usando padrão'}`);
   console.log(`🌐 URL: ${BASE_URL}`);
-  console.log(`📁 Uploads: ${BASE_URL}/uploads/posts/`);
+  console.log(`📁 GridFS: Ativo para armazenamento de imagens`);
   console.log(`📡 Endpoints principais:`);
   console.log(`   GET  /api/health`);
   console.log(`   POST /api/auth/login`);
   console.log(`   POST /api/upload`);
+  console.log(`   GET  /api/images/:id`);
   console.log(`   GET  /api/posts`);
 });
 
 // ✅ LIMPEZA PERIÓDICA DE IMAGENS ORFÃS (a cada 1 hora)
 setInterval(() => {
-  if (isDBConnected) {
+  if (isDBConnected && gridFSBucket) {
     Post.cleanupOrphanedImages();
   }
 }, 60 * 60 * 1000);
